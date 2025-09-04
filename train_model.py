@@ -13,7 +13,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 
-TARGET_COLUMN = "Rainfall(mm)"
+TARGET_COLUMN = "Rainfall"
 MODEL_PATH = "model.joblib"
 
 
@@ -26,19 +26,47 @@ def load_data(csv_path: str) -> pd.DataFrame:
 
 
 def build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-	# Ensure expected columns exist
-	required_cols = [
-		"Station_Name", "Lat", "Lon", "Elev", "Year", "Month", "Day",
-		"TMPMAX", "TMPMIN", TARGET_COLUMN
-	]
-	missing = [c for c in required_cols if c not in df.columns]
-	if missing:
-		raise ValueError(f"Missing required columns: {missing}")
+    # Ensure expected columns exist
+    required_cols = [
+        "Station_Name", "Lat", "Lon", "Elev", "Year", "Month", "Day",
+        "TMPMAX", "TMPMIN", TARGET_COLUMN
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-	# Create features and target
-	X = df.drop(columns=[TARGET_COLUMN])
-	y = df[TARGET_COLUMN]
-	return X, y
+    # Create additional features for better predictions
+    df = df.copy()
+    
+    # Create lagged rainfall feature (previous day's rainfall)
+    df['Rainfall_lag1'] = df.groupby('Station_Name')[TARGET_COLUMN].shift(1)
+    
+    # Create rolling averages for temperature
+    df['TMPMAX_avg3'] = df.groupby('Station_Name')['TMPMAX'].rolling(window=3, min_periods=1).mean().reset_index(0, drop=True)
+    df['TMPMIN_avg3'] = df.groupby('Station_Name')['TMPMIN'].rolling(window=3, min_periods=1).mean().reset_index(0, drop=True)
+    
+    # Create temperature difference
+    df['TMP_diff'] = df['TMPMAX'] - df['TMPMIN']
+    
+    # Create seasonal features
+    df['Month_sin'] = np.sin(2 * np.pi * df['Month'] / 12)
+    df['Month_cos'] = np.cos(2 * np.pi * df['Month'] / 12)
+    
+    # Create day of year
+    df['DayOfYear'] = pd.to_datetime(df[['Year', 'Month', 'Day']]).dt.dayofyear
+    df['DayOfYear_sin'] = np.sin(2 * np.pi * df['DayOfYear'] / 365)
+    df['DayOfYear_cos'] = np.cos(2 * np.pi * df['DayOfYear'] / 365)
+
+    # Create features and target
+    feature_cols = [
+        "Station_Name", "Lat", "Lon", "Elev", "Year", "Month", "Day",
+        "TMPMAX", "TMPMIN", "Rainfall_lag1", "TMPMAX_avg3", "TMPMIN_avg3",
+        "TMP_diff", "Month_sin", "Month_cos", "DayOfYear_sin", "DayOfYear_cos"
+    ]
+    
+    X = df[feature_cols]
+    y = df[TARGET_COLUMN]
+    return X, y
 
 
 def build_pipeline(X: pd.DataFrame) -> Pipeline:
@@ -65,7 +93,9 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
 		]
 	)
 
-	model = LinearRegression()
+	# Use Ridge regression for better generalization
+	from sklearn.linear_model import Ridge
+	model = Ridge(alpha=1.0)
 
 	pipeline = Pipeline(steps=[
 		("preprocessor", preprocessor),
@@ -84,6 +114,9 @@ def train_and_save(csv_path: str, model_path: str = MODEL_PATH) -> None:
 	X_train = X.loc[mask]
 	y_train = y.loc[mask]
 
+	print(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
+	print(f"Features: {list(X_train.columns)}")
+
 	pipeline = build_pipeline(X_train)
 	pipeline.fit(X_train, y_train)
 
@@ -92,6 +125,8 @@ def train_and_save(csv_path: str, model_path: str = MODEL_PATH) -> None:
 	r2 = r2_score(y_train, pred_train)
 	mae = mean_absolute_error(y_train, pred_train)
 	print(f"Training R2: {r2:.3f}, MAE: {mae:.3f}")
+	print(f"Target range: {y_train.min():.2f} - {y_train.max():.2f}")
+	print(f"Prediction range: {pred_train.min():.2f} - {pred_train.max():.2f}")
 
 	joblib.dump(pipeline, model_path)
 	print(f"Model saved to {model_path}")

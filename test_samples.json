@@ -1,0 +1,64 @@
+{
+  "samples": [
+    {
+      "Station_Name": "BUSASAMANA-NYANZA",
+      "Lat": -2.35,
+      "Lon": 29.76,
+      "Elev": 1805,
+      "Year": 2025,
+      "Month": 8,
+      "Day": 1,
+      "TMPMAX": 26.5,
+      "TMPMIN": 17.2,
+      "Rainfall": 0
+    },
+    {
+      "Station_Name": "BUSASAMANA-NYANZA",
+      "Lat": -2.35,
+      "Lon": 29.76,
+      "Elev": 1805,
+      "Year": 2025,
+      "Month": 8,
+      "Day": 2,
+      "TMPMAX": 27.0,
+      "TMPMIN": 18.1,
+      "Rainfall": 0
+    },
+    {
+      "Station_Name": "BUSASAMANA-NYANZA",
+      "Lat": -2.35,
+      "Lon": 29.76,
+      "Elev": 1805,
+      "Year": 2025,
+      "Month": 8,
+      "Day": 3,
+      "TMPMAX": 25.8,
+      "TMPMIN": 16.9,
+      "Rainfall": null
+    },
+    {
+      "Station_Name": "BUSASAMANA-NYANZA",
+      "Lat": -2.35,
+      "Lon": 29.76,
+      "Elev": 1805,
+      "Year": 2025,
+      "Month": 8,
+      "Day": 4,
+      "TMPMAX": 24.3,
+      "TMPMIN": null,
+      "Rainfall": 8.6
+    },
+    {
+      "Station_Name": "BUSASAMANA-NYANZA",
+      "Lat": -2.35,
+      "Lon": 29.76,
+      "Elev": 1805,
+      "Year": 2025,
+      "Month": 8,
+      "Day": 5,
+      "TMPMAX": null,
+      "TMPMIN": 16.8,
+      "Rainfall": 12.4
+    }
+  ]
+}

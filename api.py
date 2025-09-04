@@ -32,6 +32,7 @@ class Sample(BaseModel):
 	Day: int
 	TMPMAX: Optional[float] = None
 	TMPMIN: Optional[float] = None
+	Rainfall_lag1: Optional[float] = None  # Previous day's rainfall
 
 
 class PredictionRequest(BaseModel):
@@ -74,14 +75,49 @@ async def health():
 	return {"status": "ok"}
 
 
+def create_features_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
+	"""Create the same features as in training script"""
+	df = df.copy()
+	
+	# Create rolling averages for temperature (if we have enough data)
+	if len(df) >= 3:
+		df['TMPMAX_avg3'] = df['TMPMAX'].rolling(window=3, min_periods=1).mean()
+		df['TMPMIN_avg3'] = df['TMPMIN'].rolling(window=3, min_periods=1).mean()
+	else:
+		df['TMPMAX_avg3'] = df['TMPMAX']
+		df['TMPMIN_avg3'] = df['TMPMIN']
+	
+	# Create temperature difference
+	df['TMP_diff'] = df['TMPMAX'] - df['TMPMIN']
+	
+	# Create seasonal features
+	df['Month_sin'] = np.sin(2 * np.pi * df['Month'] / 12)
+	df['Month_cos'] = np.cos(2 * np.pi * df['Month'] / 12)
+	
+	# Create day of year
+	df['DayOfYear'] = pd.to_datetime(df[['Year', 'Month', 'Day']]).dt.dayofyear
+	df['DayOfYear_sin'] = np.sin(2 * np.pi * df['DayOfYear'] / 365)
+	df['DayOfYear_cos'] = np.cos(2 * np.pi * df['DayOfYear'] / 365)
+	
+	return df
+
+
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(req: PredictionRequest):
 	if len(req.samples) == 0:
 		raise HTTPException(status_code=400, detail="No samples provided")
 
-	# Convert list of samples to DataFrame expected by the pipeline
+	# Convert list of samples to DataFrame
 	data = [s.dict() for s in req.samples]
 	df = pd.DataFrame(data)
+
+	# Create features for prediction (same as training)
+	df = create_features_for_prediction(df)
+	
+	# Ensure we have the Rainfall_lag1 column (previous day's rainfall)
+	if 'Rainfall_lag1' not in df.columns or df['Rainfall_lag1'].isna().all():
+		# If no lagged rainfall provided, set to 0 (no previous rainfall)
+		df['Rainfall_lag1'] = 0.0
 
 	# Predict rainfall
 	model = get_model()
@@ -90,7 +126,7 @@ async def predict(req: PredictionRequest):
 	except Exception as e:
 		raise HTTPException(status_code=400, detail=f"Prediction failed: {e}")
 
-	# Build enriched response with original fields plus predicted rainfall
+	# Build enriched response
 	items: List[PredictionItem] = []
 	for sample_dict, pred in zip(data, preds):
 		item = PredictionItem(
@@ -104,4 +140,5 @@ async def predict(req: PredictionRequest):
 
 if __name__ == "__main__":
 	import uvicorn
+
 	uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
