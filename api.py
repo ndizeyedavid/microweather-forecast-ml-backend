@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional
+from datetime import timedelta
+from typing import List
 
 import joblib
 import numpy as np
@@ -10,7 +11,23 @@ from pydantic import BaseModel, Field
 
 MODEL_PATH = os.getenv("MODEL_PATH", "model.joblib")
 
-app = FastAPI(title="Rainfall Prediction API", version="1.1.0")
+FORECAST_STEPS = 7
+DEFAULT_INTERVAL = timedelta(minutes=10)
+FEATURE_COLUMNS = [
+	"rainfall_lag1",
+	"pressure_lag1",
+	"temperature_lag1",
+	"humidity_lag1",
+	"hour_sin",
+	"hour_cos",
+	"dayofyear_sin",
+	"dayofyear_cos",
+]
+
+TARGET_COLUMNS = ["rainfall", "pressure", "temperature", "humidity"]
+
+
+app = FastAPI(title="Sensor Forecast API", version="4.0.0")
 
 # Add CORS middleware
 app.add_middleware(
@@ -23,33 +40,27 @@ app.add_middleware(
 
 
 class Sample(BaseModel):
-	Station_Name: str = Field(..., description="Station name")
-	Lat: float
-	Lon: float
-	Elev: float
-	Year: int
-	Month: int
-	Day: int
-	TMPMAX: Optional[float] = None
-	TMPMIN: Optional[float] = None
-	Rainfall_lag1: Optional[float] = None  # Previous day's rainfall
+	Timestamp: str = Field(..., description="Observation timestamp (ISO or common datetime format)")
+	previous_rainfall: float = Field(..., description="Most recent rainfall measurement prior to the prediction timestamp")
+	previous_pressure: float = Field(..., description="Most recent pressure measurement prior to the prediction timestamp")
+	previous_temperature: float = Field(..., description="Most recent temperature measurement prior to the prediction timestamp")
+	previous_humidity: float = Field(..., description="Most recent humidity measurement prior to the prediction timestamp")
 
 
 class PredictionRequest(BaseModel):
 	samples: List[Sample]
 
 
+class PredictedValues(BaseModel):
+	rainfall: float
+	pressure: float
+	temperature: float
+	humidity: float
+
+
 class PredictionItem(BaseModel):
-	Station_Name: str
-	Lat: float
-	Lon: float
-	Elev: float
-	Year: int
-	Month: int
-	Day: int
-	TMPMAX: Optional[float]
-	TMPMIN: Optional[float]
-	Predicted_Rainfall_mm: float
+	Timestamp: str
+	predicted: PredictedValues
 
 
 class PredictionResponse(BaseModel):
@@ -75,31 +86,34 @@ async def health():
 	return {"status": "ok"}
 
 
-def create_features_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
-	"""Create the same features as in training script"""
-	df = df.copy()
-	
-	# Create rolling averages for temperature (if we have enough data)
-	if len(df) >= 3:
-		df['TMPMAX_avg3'] = df['TMPMAX'].rolling(window=3, min_periods=1).mean()
-		df['TMPMIN_avg3'] = df['TMPMIN'].rolling(window=3, min_periods=1).mean()
-	else:
-		df['TMPMAX_avg3'] = df['TMPMAX']
-		df['TMPMIN_avg3'] = df['TMPMIN']
-	
-	# Create temperature difference
-	df['TMP_diff'] = df['TMPMAX'] - df['TMPMIN']
-	
-	# Create seasonal features
-	df['Month_sin'] = np.sin(2 * np.pi * df['Month'] / 12)
-	df['Month_cos'] = np.cos(2 * np.pi * df['Month'] / 12)
-	
-	# Create day of year
-	df['DayOfYear'] = pd.to_datetime(df[['Year', 'Month', 'Day']]).dt.dayofyear
-	df['DayOfYear_sin'] = np.sin(2 * np.pi * df['DayOfYear'] / 365)
-	df['DayOfYear_cos'] = np.cos(2 * np.pi * df['DayOfYear'] / 365)
-	
-	return df
+def _resolve_interval(timestamps: pd.Series) -> timedelta:
+	if len(timestamps) >= 2:
+		diffs = timestamps.sort_values().diff().dropna()
+		diffs = diffs[diffs > pd.Timedelta(0)]
+		if not diffs.empty:
+			return diffs.iloc[-1].to_pytimedelta()
+	return DEFAULT_INTERVAL
+
+
+def _build_feature_row(timestamp: pd.Timestamp, prev_values: dict) -> pd.DataFrame:
+	if not isinstance(timestamp, pd.Timestamp):
+		timestamp = pd.Timestamp(timestamp)
+
+	hours = timestamp.hour + timestamp.minute / 60.0
+	day_of_year = timestamp.dayofyear
+
+	feature = {
+		"rainfall_lag1": prev_values["rainfall"],
+		"pressure_lag1": prev_values["pressure"],
+		"temperature_lag1": prev_values["temperature"],
+		"humidity_lag1": prev_values["humidity"],
+		"hour_sin": np.sin(2 * np.pi * hours / 24),
+		"hour_cos": np.cos(2 * np.pi * hours / 24),
+		"dayofyear_sin": np.sin(2 * np.pi * day_of_year / 365.25),
+		"dayofyear_cos": np.cos(2 * np.pi * day_of_year / 365.25),
+	}
+
+	return pd.DataFrame([feature], columns=FEATURE_COLUMNS)
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -111,29 +125,76 @@ async def predict(req: PredictionRequest):
 	data = [s.dict() for s in req.samples]
 	df = pd.DataFrame(data)
 
-	# Create features for prediction (same as training)
-	df = create_features_for_prediction(df)
-	
-	# Ensure we have the Rainfall_lag1 column (previous day's rainfall)
-	if 'Rainfall_lag1' not in df.columns or df['Rainfall_lag1'].isna().all():
-		# If no lagged rainfall provided, set to 0 (no previous rainfall)
-		df['Rainfall_lag1'] = 0.0
+	required_cols = [
+		"Timestamp",
+		"previous_rainfall",
+		"previous_pressure",
+		"previous_temperature",
+		"previous_humidity",
+	]
+	missing_cols = [c for c in required_cols if c not in df.columns]
+	if missing_cols:
+		raise HTTPException(status_code=400, detail=f"Missing required columns: {missing_cols}")
 
-	# Predict rainfall
+	# Parse timestamps and numerical inputs
+	df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+	if df["Timestamp"].isna().any():
+		raise HTTPException(status_code=400, detail="Some timestamp values could not be parsed. Ensure they use a valid datetime format.")
+
+	for col in ["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"]:
+		df[col] = pd.to_numeric(df[col], errors="coerce")
+	if df[["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"]].isna().any().any():
+		raise HTTPException(status_code=400, detail="Previous sensor readings must be numeric and non-null.")
+
+	# Sort samples chronologically to simulate progressive forecasting
+	df = df.sort_values("Timestamp").reset_index(drop=True)
+
+	interval = _resolve_interval(df["Timestamp"])
+
 	model = get_model()
-	try:
-		preds = model.predict(df)
-	except Exception as e:
-		raise HTTPException(status_code=400, detail=f"Prediction failed: {e}")
 
-	# Build enriched response
+	last_pred = None
+	last_time = None
+
+	# Walk through provided samples to warm-start the state
+	for _, row in df.iterrows():
+		prev_values = {
+			"rainfall": float(row["previous_rainfall"]),
+			"pressure": float(row["previous_pressure"]),
+			"temperature": float(row["previous_temperature"]),
+			"humidity": float(row["previous_humidity"]),
+		}
+		features = _build_feature_row(row["Timestamp"], prev_values)
+		try:
+			pred = model.predict(features)[0]
+		except Exception as exc:
+			raise HTTPException(status_code=400, detail=f"Prediction failed: {exc}")
+		last_pred = {name: float(value) for name, value in zip(TARGET_COLUMNS, pred)}
+		last_time = row["Timestamp"]
+
+	if last_pred is None or last_time is None:
+		raise HTTPException(status_code=400, detail="Unable to generate forecasts from provided samples.")
+
+	# Generate progressive forecasts
 	items: List[PredictionItem] = []
-	for sample_dict, pred in zip(data, preds):
-		item = PredictionItem(
-			Predicted_Rainfall_mm=float(pred),
-			**sample_dict,
+	current_state = last_pred
+	current_time = last_time
+
+	for _ in range(FORECAST_STEPS):
+		next_time = current_time + interval
+		features = _build_feature_row(next_time, current_state)
+		try:
+			pred = model.predict(features)[0]
+		except Exception as exc:
+			raise HTTPException(status_code=400, detail=f"Prediction failed during forecast rollout: {exc}")
+		current_state = {name: float(value) for name, value in zip(TARGET_COLUMNS, pred)}
+		items.append(
+			PredictionItem(
+				Timestamp=pd.Timestamp(next_time).isoformat(),
+				predicted=PredictedValues(**current_state),
+			)
 		)
-		items.append(item)
+		current_time = next_time
 
 	return PredictionResponse(items=items)
 
