@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from uuid import uuid4
 
 import joblib
@@ -29,12 +29,12 @@ FEATURE_COLUMNS = [
 
 TARGET_COLUMNS = ["rainfall", "pressure", "temperature", "humidity"]
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://microweatherforecast_researchso:fbf6e56a7f522dc529b440a9b43186546bbcf5e3@cphya2.h.filess.io:61033")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "microweatherforecast_researchso")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sensor_forecast")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "measurements")
 
 
-_mongo_client: MongoClient | None = None
+_mongo_client: Optional[MongoClient] = None
 
 
 app = FastAPI(title="Sensor Forecast API", version="4.0.0")
