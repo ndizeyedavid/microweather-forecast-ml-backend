@@ -5,4 +5,5 @@ pandas
 scikit-learn
 joblib
 pydantic
+pymongo
 python-multipart==0.0.9
