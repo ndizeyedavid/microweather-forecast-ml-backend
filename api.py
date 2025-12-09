@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 MODEL_PATH = os.getenv("MODEL_PATH", "model.joblib")
 
 FORECAST_STEPS = 7
-DEFAULT_INTERVAL = timedelta(minutes=10)
+DEFAULT_INTERVAL = timedelta(minutes=180)
 FEATURE_COLUMNS = [
 	"rainfall_lag1",
 	"pressure_lag1",
