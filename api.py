@@ -1,6 +1,7 @@
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import List
+from uuid import uuid4
 
 import joblib
 import numpy as np
@@ -8,6 +9,8 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
 MODEL_PATH = os.getenv("MODEL_PATH", "model.joblib")
 
@@ -25,6 +28,13 @@ FEATURE_COLUMNS = [
 ]
 
 TARGET_COLUMNS = ["rainfall", "pressure", "temperature", "humidity"]
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://microweatherforecast_researchso:fbf6e56a7f522dc529b440a9b43186546bbcf5e3@cphya2.h.filess.io:61033")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "microweatherforecast_researchso")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "measurements")
+
+
+_mongo_client: MongoClient | None = None
 
 
 app = FastAPI(title="Sensor Forecast API", version="4.0.0")
@@ -68,6 +78,33 @@ class PredictionResponse(BaseModel):
 
 
 _model = None
+
+
+
+def _get_collection():
+	global _mongo_client
+	if _mongo_client is None:
+		_mongo_client = MongoClient(MONGO_URI)
+	return _mongo_client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+
+
+def _serialize_document(doc: dict) -> dict:
+	serialized = dict(doc)
+	serialized["_id"] = str(serialized.get("_id"))
+	timestamp = serialized.get("timestamp")
+	if isinstance(timestamp, datetime):
+		serialized["timestamp"] = timestamp.isoformat()
+	created_at = serialized.get("created_at")
+	if isinstance(created_at, datetime):
+		serialized["created_at"] = created_at.isoformat()
+	return serialized
+
+
+def _persist_records(records: List[dict]) -> None:
+	if not records:
+		return
+	collection = _get_collection()
+	collection.insert_many(records)
 
 
 def get_model():
@@ -152,6 +189,8 @@ async def predict(req: PredictionRequest):
 	interval = _resolve_interval(df["Timestamp"])
 
 	model = get_model()
+	request_id = str(uuid4())
+	created_at = datetime.utcnow()
 
 	last_pred = None
 	last_time = None
@@ -196,7 +235,53 @@ async def predict(req: PredictionRequest):
 		)
 		current_time = next_time
 
+	records: List[dict] = []
+	for idx, row in df.iterrows():
+		records.append(
+			{
+				"request_id": request_id,
+				"label": "real",
+				"sequence": idx,
+				"timestamp": pd.Timestamp(row["Timestamp"]).to_pydatetime(),
+				"values": {
+					"rainfall": float(row["previous_rainfall"]),
+					"pressure": float(row["previous_pressure"]),
+					"temperature": float(row["previous_temperature"]),
+					"humidity": float(row["previous_humidity"]),
+				},
+				"source": "input",
+				"created_at": created_at,
+			},
+		)
+
+	for step_index, item in enumerate(items, start=1):
+		records.append(
+			{
+				"request_id": request_id,
+				"label": "predicted",
+				"sequence": step_index,
+				"timestamp": pd.Timestamp(item.Timestamp).to_pydatetime(),
+				"values": item.predicted.dict(),
+				"source": "forecast",
+				"created_at": created_at,
+			},
+		)
+
+	try:
+		_persist_records(records)
+	except PyMongoError as exc:
+		raise HTTPException(status_code=500, detail=f"Database persistence failed: {exc}")
+
 	return PredictionResponse(items=items)
+
+
+@app.get("/predictions")
+async def list_predictions():
+	try:
+		docs = list(_get_collection().find().sort("timestamp", 1))
+	except PyMongoError as exc:
+		raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+	return {"items": [_serialize_document(doc) for doc in docs]}
 
 
 if __name__ == "__main__":
