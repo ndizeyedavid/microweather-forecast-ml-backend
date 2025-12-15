@@ -32,6 +32,7 @@ TARGET_COLUMNS = ["rainfall", "pressure", "temperature", "humidity"]
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sensor_forecast")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "measurements")
+MAX_RECORDS = int(os.getenv("MONGO_MAX_RECORDS", "100"))
 
 
 _mongo_client: Optional[MongoClient] = None
@@ -105,6 +106,20 @@ def _persist_records(records: List[dict]) -> None:
 		return
 	collection = _get_collection()
 	collection.insert_many(records)
+
+
+def _enforce_collection_limit(limit: int = MAX_RECORDS) -> None:
+	if limit <= 0:
+		return
+	collection = _get_collection()
+	total = collection.count_documents({})
+	if total <= limit:
+		return
+	excess = total - limit
+	cursor = collection.find({}, {"_id": 1}).sort("created_at", 1).limit(excess)
+	ids_to_delete = [doc["_id"] for doc in cursor]
+	if ids_to_delete:
+		collection.delete_many({"_id": {"$in": ids_to_delete}})
 
 
 def get_model():
@@ -269,6 +284,7 @@ async def predict(req: PredictionRequest):
 
 	try:
 		_persist_records(records)
+		_enforce_collection_limit()
 	except PyMongoError as exc:
 		raise HTTPException(status_code=500, detail=f"Database persistence failed: {exc}")
 
