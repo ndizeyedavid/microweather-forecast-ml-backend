@@ -6,10 +6,12 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <math.h>
+#include <esp_system.h>
 
 // ---------- WIFI (EDIT THESE!) ----------
 const char* WIFI_SSID     = "UPI";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_PASSWORD = "poly#2023";
 
 // ---------- Backend ----------
 const char* BACKEND_URL = "https://microweather-forecast-ml-backend.onrender.com/predict";
@@ -42,8 +44,92 @@ float predictedPress = 0;
 String predictedTime = "";
 bool haveForecast    = false;
 
-// Use last rainfall value as lag for next request (ESP lacks rainfall sensor)
+// Use simulated rainfall values while no physical sensor is available
 float lastRainfall = 0.0f;
+
+// ----------------------------------------------------------
+// Visual helpers
+// ----------------------------------------------------------
+void drawRainIcon(int cx, int cy, uint16_t color) {
+  tft.fillCircle(cx, cy - 4, 6, color);
+  tft.fillTriangle(cx - 6, cy - 2, cx + 6, cy - 2, cx, cy + 8, color);
+}
+
+void drawThermometerIcon(int x, int y, uint16_t color) {
+  tft.drawRoundRect(x, y - 10, 8, 20, 3, color);
+  tft.fillCircle(x + 4, y + 6, 6, color);
+}
+
+void drawHumidityIcon(int cx, int cy, uint16_t color) {
+  tft.fillCircle(cx, cy - 2, 6, color);
+  tft.fillTriangle(cx - 6, cy + 2, cx + 6, cy + 2, cx, cy + 10, color);
+}
+
+void drawPressureIcon(int cx, int cy, uint16_t color) {
+  tft.drawCircle(cx, cy, 8, color);
+  tft.drawLine(cx, cy, cx, cy - 5, color);
+  tft.drawLine(cx, cy, cx + 4, cy + 3, color);
+}
+
+// ----------------------------------------------------------
+// Forecast card rendering
+// ----------------------------------------------------------
+void drawForecastCard(int columnIndex, const char* title, float value, const char* unit, void (*iconFn)(int, int, uint16_t)) {
+  int colWidth = tft.width() / 3;
+  int cardWidth = colWidth - 12;
+  int cardHeight = 34;
+  int x = columnIndex * colWidth + 6;
+  int y = 298;
+
+  tft.fillRoundRect(x, y, cardWidth, cardHeight, 6, TFT_NAVY);
+  tft.drawRoundRect(x, y, cardWidth, cardHeight, 6, TFT_CYAN);
+
+  if (iconFn) {
+    iconFn(x + 12, y + cardHeight / 2, TFT_CYAN);
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setCursor(x + 26, y + 6);
+  tft.print(title);
+  tft.setCursor(x + 26, y + 20);
+  tft.printf("%.2f %s", value, unit);
+}
+
+void drawRainBadge() {
+  int badgeWidth = 180;
+  int badgeHeight = 26;
+  int x = (tft.width() - badgeWidth) / 2;
+  int y = 198;
+
+  tft.fillRoundRect(x, y, badgeWidth, badgeHeight, 8, TFT_NAVY);
+  tft.drawRoundRect(x, y, badgeWidth, badgeHeight, 8, TFT_CYAN);
+  drawRainIcon(x + 18, y + badgeHeight / 2 + 4, TFT_CYAN);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setCursor(x + 36, y + 6);
+  tft.print("Next Rain");
+  tft.setCursor(x + 36, y + 16);
+  tft.printf("%.3f mm", predictedRain);
+
+  if (predictedTime.length() >= 16) {
+    String hhmm = predictedTime.substring(11, 16);
+    tft.setCursor(x + badgeWidth - 50, y + 6);
+    tft.print(hhmm);
+  }
+}
+
+// ----------------------------------------------------------
+// Random rainfall simulation
+// ----------------------------------------------------------
+float generatePseudoRainfall() {
+  float base = random(0, 2000) / 2000.0f;  // 0.000 - 0.999 steps
+  float rainfall = base * base * 2.0f;     // bias towards small values, max ~2.0
+  rainfall = constrain(rainfall, 0.0f, 2.0f);
+  rainfall = roundf(rainfall * 1000.0f) / 1000.0f;
+  return rainfall;
+}
 
 // ----------------------------------------------------------
 // Helper to build ISO timestamp with configured timezone
@@ -83,11 +169,14 @@ bool fetchForecastFromBackend() {
 
   String isoTimestamp = buildIsoTimestamp(timeinfo);
 
+  float simulatedRain = generatePseudoRainfall();
+  lastRainfall = simulatedRain;
+
   DynamicJsonDocument payload(512);
   JsonArray samples = payload.createNestedArray("samples");
   JsonObject sample = samples.createNestedObject();
   sample["Timestamp"] = isoTimestamp;
-  sample["previous_rainfall"] = lastRainfall;
+  sample["previous_rainfall"] = simulatedRain;
   sample["previous_pressure"] = currentPress;
   sample["previous_temperature"] = currentTemp;
   sample["previous_humidity"] = currentHum;
@@ -131,7 +220,8 @@ bool fetchForecastFromBackend() {
     return false;
   }
 
-  predictedRain  = predicted["rainfall"]    | predictedRain;
+  float parsedRain = predicted["rainfall"] | predictedRain;
+  predictedRain  = fabsf(parsedRain);
   predictedPress = predicted["pressure"]    | currentPress;
   predictedTemp  = predicted["temperature"] | currentTemp;
   predictedHum   = predicted["humidity"]    | currentHum;
@@ -241,13 +331,11 @@ void updateClock() {
 
   drawCenteredText(cond, 180, 2, TFT_LIGHTGREY);
 
-  tft.fillRect(0, 200, tft.width(), 20, TFT_BLACK);
+  tft.fillRect(0, 198, tft.width(), 32, TFT_BLACK);
   if (haveForecast) {
-    char forecastBuf[40];
-    snprintf(forecastBuf, sizeof(forecastBuf), "Next Rain: %.2f mm", predictedRain);
-    drawCenteredText(forecastBuf, 200, 1, TFT_CYAN);
+    drawRainBadge();
   } else {
-    drawCenteredText("Forecast pending...", 200, 1, TFT_DARKGREY);
+    drawCenteredText("Forecast pending...", 206, 1, TFT_DARKGREY);
   }
 }
 
@@ -277,18 +365,20 @@ void updateSensorTiles() {
   tft.setTextSize(1);
   tft.print(" hPa");
 
+  tft.fillRect(0, 292, tft.width(), tft.height() - 292, TFT_BLACK);
   if (haveForecast) {
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    String label = "Predicted next interval";
+    if (predictedTime.length() >= 16) {
+      label += " @ ";
+      label += predictedTime.substring(11, 16);
+    }
+    drawCenteredText(label.c_str(), 292, 1, TFT_CYAN);
 
-    tft.setCursor(colWidth/2 - 40, 295);
-    tft.printf("-> %.1fC", predictedTemp);
-
-    tft.setCursor(colWidth + colWidth/2 - 40, 295);
-    tft.printf("-> %.1f%%", predictedHum);
-
-    tft.setCursor(colWidth*2 + colWidth/2 - 52, 295);
-    tft.printf("-> %.1f hPa", predictedPress);
+    drawForecastCard(0, "Temp", predictedTemp, "C", drawThermometerIcon);
+    drawForecastCard(1, "Humidity", predictedHum, "%", drawHumidityIcon);
+    drawForecastCard(2, "Pressure", predictedPress, "hPa", drawPressureIcon);
+  } else {
+    drawCenteredText("Predicted data unavailable", 300, 1, TFT_DARKGREY);
   }
 }
 
@@ -306,6 +396,8 @@ void readBME280() {
 // ==========================================================
 void setup() {
   Serial.begin(115200);
+
+  randomSeed(esp_random());
 
   // I2C + BME280
   Wire.begin(SDA_PIN, SCL_PIN);

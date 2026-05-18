@@ -291,6 +291,39 @@ async def predict(req: PredictionRequest):
 	return PredictionResponse(items=items)
 
 
+class MeasurementValues(BaseModel):
+	temperature: float
+	humidity: float
+	pressure: float
+	rainfall: float
+
+
+class MeasurementResponse(BaseModel):
+	timestamp: str
+	values: MeasurementValues
+
+
+@app.get("/measurements/latest", response_model=MeasurementResponse)
+async def get_latest_measurement():
+	try:
+		collection = _get_collection()
+		doc = collection.find_one({"label": "real"}, sort=[("timestamp", -1)])
+		if not doc:
+			raise HTTPException(status_code=404, detail="No measurements found")
+		serialized = _serialize_document(doc)
+		return MeasurementResponse(
+			timestamp=serialized["timestamp"],
+			values=MeasurementValues(
+				temperature=serialized["values"]["temperature"],
+				humidity=serialized["values"]["humidity"],
+				pressure=serialized["values"]["pressure"],
+				rainfall=serialized["values"]["rainfall"]
+			)
+		)
+	except PyMongoError as exc:
+		raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/predictions")
 async def list_predictions():
 	try:
