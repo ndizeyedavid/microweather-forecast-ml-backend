@@ -298,9 +298,19 @@ class MeasurementValues(BaseModel):
 	rainfall: float
 
 
-class MeasurementResponse(BaseModel):
+class MeasurementItem(BaseModel):
+	id: str
 	timestamp: str
-	values: MeasurementValues
+	temperature: float
+	humidity: float
+	pressure: float
+	rainfall: float
+	label: str
+	source: str
+
+
+class AllMeasurementsResponse(BaseModel):
+	items: List[MeasurementItem]
 
 
 @app.get("/measurements/latest", response_model=MeasurementResponse)
@@ -320,6 +330,29 @@ async def get_latest_measurement():
 				rainfall=serialized["values"]["rainfall"]
 			)
 		)
+	except PyMongoError as exc:
+		raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/measurements", response_model=AllMeasurementsResponse)
+async def get_all_measurements():
+	try:
+		collection = _get_collection()
+		docs = list(collection.find().sort("timestamp", -1))
+		items = []
+		for doc in docs:
+			serialized = _serialize_document(doc)
+			items.append(MeasurementItem(
+				id=serialized["_id"],
+				timestamp=serialized["timestamp"],
+				temperature=serialized["values"]["temperature"],
+				humidity=serialized["values"]["humidity"],
+				pressure=serialized["values"]["pressure"],
+				rainfall=serialized["values"]["rainfall"],
+				label=serialized["label"],
+				source=serialized["source"]
+			))
+		return AllMeasurementsResponse(items=items)
 	except PyMongoError as exc:
 		raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
