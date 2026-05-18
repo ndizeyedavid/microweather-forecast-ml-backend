@@ -298,6 +298,11 @@ class MeasurementValues(BaseModel):
 	rainfall: float
 
 
+class MeasurementResponse(BaseModel):
+	timestamp: str
+	values: MeasurementValues
+
+
 class MeasurementItem(BaseModel):
 	id: str
 	timestamp: str
