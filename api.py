@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+from auth import router as auth_router
+
 MODEL_PATH = os.getenv("MODEL_PATH", "model.joblib")
 
 FORECAST_STEPS = 7
