@@ -40,6 +40,8 @@ _mongo_client: Optional[MongoClient] = None
 
 app = FastAPI(title="Sensor Forecast API", version="4.0.0")
 
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+
 # Add CORS middleware
 app.add_middleware(
 	CORSMiddleware,
