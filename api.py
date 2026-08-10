@@ -89,7 +89,10 @@ _model = None
 def _get_collection():
 	global _mongo_client
 	if _mongo_client is None:
-		_mongo_client = MongoClient(MONGO_URI)
+		_mongo_client = MongoClient(
+			MONGO_URI,
+			serverSelectionTimeoutMS=int(os.getenv("MONGO_TIMEOUT_MS", "5000")),
+		)
 	return _mongo_client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
 
 

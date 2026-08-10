@@ -29,11 +29,22 @@ _client: Optional[MongoClient] = None
 
 def _get_users_collection():
 	global _client
-	if _client is None:
-		_client = MongoClient(MONGO_URI)
-		_col = _client[MONGO_DB_NAME][USERS_COLLECTION]
-		_col.create_index([("email", ASCENDING)], unique=True)
-	return _col
+	try:
+		if _client is None:
+			_client = MongoClient(
+				MONGO_URI,
+				serverSelectionTimeoutMS=int(os.getenv("MONGO_TIMEOUT_MS", "5000")),
+			)
+			_col = _client[MONGO_DB_NAME][USERS_COLLECTION]
+			_col.create_index([("email", ASCENDING)], unique=True)
+		return _col
+	except HTTPException:
+		raise
+	except Exception as exc:
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail=f"Database unavailable: {exc}",
+		) from exc
 
 
 def _serialize_user(doc: dict) -> dict:
@@ -132,27 +143,33 @@ def get_current_user(
 
 @router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 async def signup(req: SignupRequest):
-	collection = _get_users_collection()
-	user = {
-		"name": req.name.strip(),
-		"email": req.email.lower().strip(),
-		"password_hash": _hash_password(req.password),
-		"created_at": datetime.utcnow(),
-	}
 	try:
-		result = collection.insert_one(user)
-	except DuplicateKeyError:
-		raise HTTPException(
-			status_code=status.HTTP_409_CONFLICT,
-			detail="An account with this email already exists",
+		collection = _get_users_collection()
+		user = {
+			"name": req.name.strip(),
+			"email": req.email.lower().strip(),
+			"password_hash": _hash_password(req.password),
+			"created_at": datetime.utcnow(),
+		}
+		try:
+			result = collection.insert_one(user)
+		except DuplicateKeyError:
+			raise HTTPException(
+				status_code=status.HTTP_409_CONFLICT,
+				detail="An account with this email already exists",
+			)
+		user["_id"] = result.inserted_id
+		return AuthResponse(
+			token=_create_token(str(result.inserted_id)),
+			user=UserResponse(**_serialize_user(user)),
 		)
-	except PyMongoError as exc:
+	except HTTPException:
+		raise
+	except Exception as exc:
 		raise HTTPException(
 			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail=f"Database error: {exc}",
-		)
-	user["_id"] = result.inserted_id
-	return AuthResponse(token=_create_token(str(result.inserted_id)), user=UserResponse(**_serialize_user(user)))
+			detail=f"Signup failed: {exc}",
+		) from exc
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -161,20 +178,22 @@ async def login(req: LoginRequest):
 		user = _get_users_collection().find_one(
 			{"email": req.email.lower().strip()}
 		)
-	except PyMongoError as exc:
+		if user is None or not _verify_password(req.password, user.get("password_hash", "")):
+			raise HTTPException(
+				status_code=status.HTTP_401_UNAUTHORIZED,
+				detail="Invalid email or password",
+			)
+		return AuthResponse(
+			token=_create_token(str(user["_id"])),
+			user=UserResponse(**_serialize_user(user)),
+		)
+	except HTTPException:
+		raise
+	except Exception as exc:
 		raise HTTPException(
 			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail=f"Database error: {exc}",
-		)
-	if user is None or not _verify_password(req.password, user.get("password_hash", "")):
-		raise HTTPException(
-			status_code=status.HTTP_401_UNAUTHORIZED,
-			detail="Invalid email or password",
-		)
-	return AuthResponse(
-		token=_create_token(str(user["_id"])),
-		user=UserResponse(**_serialize_user(user)),
-	)
+			detail=f"Login failed: {exc}",
+		) from exc
 
 
 @router.get("/me", response_model=UserResponse)
