@@ -35,8 +35,8 @@ def _get_users_collection():
 				MONGO_URI,
 				serverSelectionTimeoutMS=int(os.getenv("MONGO_TIMEOUT_MS", "5000")),
 			)
-			_col = _client[MONGO_DB_NAME][USERS_COLLECTION]
-			_col.create_index([("email", ASCENDING)], unique=True)
+		_col = _client[MONGO_DB_NAME][USERS_COLLECTION]
+		_col.create_index([("email", ASCENDING)], unique=True)
 		return _col
 	except HTTPException:
 		raise
