@@ -17,6 +17,7 @@ const char* WIFI_PASSWORD = "Espoir%55";
 // send + read data without a token.
 const char* BACKEND_URL       = "https://microweather-forecast-ml-backend.onrender.com/predict";
 const char* MEASUREMENTS_URL  = "https://microweather-forecast-ml-backend.onrender.com/measurements/latest";
+const char* HEALTH_URL        = "https://microweather-forecast-ml-backend.onrender.com/health";
 
 // ---------- NTP / Time ----------
 const char* NTP_SERVER = "pool.ntp.org";
@@ -193,8 +194,11 @@ String buildIsoTimestamp(const struct tm& timeinfo) {
 // ----------------------------------------------------------
 bool fetchForecastFromBackend() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected. Skipping forecast fetch.");
-    return false;
+    ensureWiFiReconnect();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi not connected. Skipping forecast fetch.");
+      return false;
+    }
   }
 
   struct tm timeinfo;
@@ -220,32 +224,80 @@ bool fetchForecastFromBackend() {
   String jsonBody;
   serializeJson(payload, jsonBody);
 
-  // ESP8266's HTTPClient needs an explicit TLS client for https:// URLs
-  // (unlike ESP32, it has no bare begin(url) overload for TLS).
-  // setInsecure() skips certificate validation — fine for a hobby
-  // project, but means no protection against a MITM on your network.
-  WiFiClientSecure client;
-  client.setInsecure();
-  // Keeps BearSSL's RAM footprint down, which matters a lot on ESP8266's
-  // limited heap.
-  client.setBufferSizes(1024, 512);
-
-  HTTPClient http;
-  http.setTimeout(8000);
-  http.begin(client, BACKEND_URL);
-  http.addHeader("Content-Type", "application/json");
-
-  int statusCode = http.POST(jsonBody);
-  if (statusCode < 200 || statusCode >= 300) {
-    Serial.printf("Forecast request failed: HTTP %d\n", statusCode);
-    http.end();
+  // Render free instances sleep and cold-start slowly, so the very first
+  // request can hit a dead TLS connection (HTTP -5 = connection lost).
+  // Wake the backend up with a cheap /health GET before posting.
+  if (!wakeBackend()) {
+    Serial.println("Backend unreachable (GET /health failed). Skipping forecast fetch.");
     return false;
   }
 
-  String response = http.getString();
-  http.end();
+  // Retry the POST a few times so a slow cold start doesn't count as an
+  // error. Transport errors (negative codes) are ESP8266/TLS issues;
+  // positive codes mean the server answered (check Render logs then).
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    // Generous BearSSL buffers so the full forecast response can be read
+    // without the TLS connection being dropped mid-transfer (HTTP -5).
+    client.setBufferSizes(2048, 2048);
 
-  DynamicJsonDocument respDoc(2048);
+    HTTPClient http;
+    http.setTimeout(12000);
+    http.begin(client, BACKEND_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    int statusCode = http.POST(jsonBody);
+
+    if (statusCode >= 200 && statusCode < 300) {
+      String response = http.getString();
+      http.end();
+      return parseForecastResponse(response);
+    }
+
+    String errDetails = (statusCode < 0) ? http.errorToString(statusCode) : "";
+    http.end();
+
+    if (statusCode < 0) {
+      Serial.printf("Forecast fetch attempt %d/3 failed (HTTP %d: %s)\n",
+                    attempt, statusCode, errDetails.c_str());
+    } else {
+      // Reached the server but it answered with an error -> backend-side
+      // problem (check Render logs / MongoDB config), not the board.
+      Serial.printf("Forecast request failed: HTTP %d\n", statusCode);
+    }
+
+    delay(1500);
+  }
+
+  return false;
+}
+
+// ----------------------------------------------------------
+// Wake a sleeping backend instance (Render free tier) and verify
+// it is actually responding before we spend time posting forecasts.
+// ----------------------------------------------------------
+bool wakeBackend() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setBufferSizes(1024, 512);
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(client, HEALTH_URL);
+
+  int statusCode = http.GET();
+  http.end();
+  return (statusCode >= 200 && statusCode < 300);
+}
+
+// ----------------------------------------------------------
+// Parse the /predict response body into the forecast state.
+// ----------------------------------------------------------
+bool parseForecastResponse(const String& response) {
+  DynamicJsonDocument respDoc(4096);
   DeserializationError err = deserializeJson(respDoc, response);
   if (err) {
     Serial.print("Failed to parse forecast response: ");
