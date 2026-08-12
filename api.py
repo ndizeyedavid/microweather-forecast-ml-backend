@@ -15,6 +15,7 @@ from auth import router as auth_router
 
 FORECAST_STEPS = 7
 DEFAULT_INTERVAL = timedelta(minutes=180)
+FORECAST_HISTORY = int(os.getenv("FORECAST_HISTORY", "10"))
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sensor_forecast")
@@ -40,15 +41,15 @@ app.add_middleware(
 
 
 class Sample(BaseModel):
-	Timestamp: str = Field(..., description="Observation timestamp (ISO or common datetime format)")
-	previous_rainfall: float = Field(..., description="Most recent rainfall measurement prior to the prediction timestamp")
-	previous_pressure: float = Field(..., description="Most recent pressure measurement prior to the prediction timestamp")
-	previous_temperature: float = Field(..., description="Most recent temperature measurement prior to the prediction timestamp")
-	previous_humidity: float = Field(..., description="Most recent humidity measurement prior to the prediction timestamp")
+	Timestamp: str = Field(default="", description="Observation timestamp (ISO or common datetime format)")
+	previous_rainfall: Optional[float] = Field(default=None, description="Most recent rainfall measurement prior to the prediction timestamp")
+	previous_pressure: Optional[float] = Field(default=None, description="Most recent pressure measurement prior to the prediction timestamp")
+	previous_temperature: Optional[float] = Field(default=None, description="Most recent temperature measurement prior to the prediction timestamp")
+	previous_humidity: Optional[float] = Field(default=None, description="Most recent humidity measurement prior to the prediction timestamp")
 
 
 class PredictionRequest(BaseModel):
-	samples: List[Sample]
+	samples: Optional[List[Sample]] = Field(default=None, description="Optional explicit samples. When omitted, forecasts are seeded from the latest real readings in the database.")
 
 
 class PredictedValues(BaseModel):
@@ -166,61 +167,85 @@ def _resolve_interval(timestamps: pd.Series) -> timedelta:
 	return DEFAULT_INTERVAL
 
 
+def _get_recent_real_readings(limit: int = FORECAST_HISTORY) -> List[dict]:
+	"""Return the most recent `limit` real sensor readings from the DB in chronological order."""
+	collection = _get_collection()
+	docs = list(collection.find({"label": "real"}).sort("timestamp", -1).limit(limit))
+	readings: List[dict] = []
+	for doc in reversed(docs):
+		values = doc.get("values", {})
+		readings.append(
+			{
+				"timestamp": doc.get("timestamp"),
+				"values": {
+					"rainfall": float(values.get("rainfall", 0.0)),
+					"pressure": float(values.get("pressure", 0.0)),
+					"temperature": float(values.get("temperature", 0.0)),
+					"humidity": float(values.get("humidity", 0.0)),
+				},
+			}
+		)
+	return readings
+
+
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(req: PredictionRequest):
-	if len(req.samples) == 0:
-		raise HTTPException(status_code=400, detail="No samples provided")
+	samples = req.samples or []
 
-	# Convert list of samples to DataFrame
-	data = [s.dict() for s in req.samples]
-	df = pd.DataFrame(data)
+	# Warm-start the running state from the DB before generating anything.
+	db_readings = None
+	try:
+		db_readings = _get_recent_real_readings()
+	except PyMongoError:
+		db_readings = None
 
-	required_cols = [
-		"Timestamp",
-		"previous_rainfall",
-		"previous_pressure",
-		"previous_temperature",
-		"previous_humidity",
-	]
-	missing_cols = [c for c in required_cols if c not in df.columns]
-	if missing_cols:
-		raise HTTPException(status_code=400, detail=f"Missing required columns: {missing_cols}")
+	last_state = None
+	last_time = None
+	interval = DEFAULT_INTERVAL
+	warm_source = "db"
 
-	# Parse timestamps and numerical inputs
-	df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-	if df["Timestamp"].isna().any():
-		raise HTTPException(status_code=400, detail="Some timestamp values could not be parsed. Ensure they use a valid datetime format.")
+	# Prefer DB history, then fall back to explicit request samples.
+	if db_readings:
+		last_state = dict(db_readings[-1]["values"])
+		last_time = db_readings[-1]["timestamp"]
+		if last_time is not None:
+			last_time = pd.Timestamp(last_time)
+		ts_series = pd.Series(
+			[pd.Timestamp(r["timestamp"]) for r in db_readings if r.get("timestamp") is not None]
+		)
+		if not ts_series.empty:
+			interval = _resolve_interval(ts_series)
 
-	for col in ["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"]:
-		df[col] = pd.to_numeric(df[col], errors="coerce")
-	if df[["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"]].isna().any().any():
-		raise HTTPException(status_code=400, detail="Previous sensor readings must be numeric and non-null.")
+	if last_state is None and samples:
+		warm_source = "request"
+		# Convert list of samples to DataFrame
+		df = pd.DataFrame([s.dict() for s in samples])
+		df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+		for col in ["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"]:
+			df[col] = pd.to_numeric(df[col], errors="coerce")
+		df = df.dropna(subset=["Timestamp"] + ["previous_rainfall", "previous_pressure", "previous_temperature", "previous_humidity"])
+		df = df.sort_values("Timestamp").reset_index(drop=True)
+		if not df.empty:
+			last_state = {
+				"rainfall": float(df["previous_rainfall"].iloc[-1]),
+				"pressure": float(df["previous_pressure"].iloc[-1]),
+				"temperature": float(df["previous_temperature"].iloc[-1]),
+				"humidity": float(df["previous_humidity"].iloc[-1]),
+			}
+			last_time = pd.Timestamp(df["Timestamp"].iloc[-1])
+			interval = _resolve_interval(df["Timestamp"])
 
-	# Sort samples chronologically to simulate progressive forecasting
-	df = df.sort_values("Timestamp").reset_index(drop=True)
-
-	interval = _resolve_interval(df["Timestamp"])
+	if last_state is None or last_time is None:
+		raise HTTPException(
+			status_code=400,
+			detail="No real readings found in the database and no valid samples provided.",
+		)
 
 	request_id = str(uuid4())
 	created_at = datetime.utcnow()
 
-	last_state = None
-	last_time = None
-
-	# Warm-start: build the running state from the provided readings.
-	for _, row in df.iterrows():
-		last_state = {
-			"rainfall": float(row["previous_rainfall"]),
-			"pressure": float(row["previous_pressure"]),
-			"temperature": float(row["previous_temperature"]),
-			"humidity": float(row["previous_humidity"]),
-		}
-		last_time = row["Timestamp"]
-
-	if last_state is None or last_time is None:
-		raise HTTPException(status_code=400, detail="Unable to generate forecasts from provided samples.")
-
-	# Generate progressive forecasts by evolving each field plausibly.
+	# Generate progressive forecasts by evolving each field plausibly from the
+	# most recent real state.
 	items: List[PredictionItem] = []
 	current_state = last_state
 	current_time = last_time
@@ -237,24 +262,6 @@ async def predict(req: PredictionRequest):
 		current_time = next_time
 
 	records: List[dict] = []
-	for idx, row in df.iterrows():
-		records.append(
-			{
-				"request_id": request_id,
-				"label": "real",
-				"sequence": idx,
-				"timestamp": pd.Timestamp(row["Timestamp"]).to_pydatetime(),
-				"values": {
-					"rainfall": float(row["previous_rainfall"]),
-					"pressure": float(row["previous_pressure"]),
-					"temperature": float(row["previous_temperature"]),
-					"humidity": float(row["previous_humidity"]),
-				},
-				"source": "input",
-				"created_at": created_at,
-			},
-		)
-
 	for step_index, item in enumerate(items, start=1):
 		records.append(
 			{
