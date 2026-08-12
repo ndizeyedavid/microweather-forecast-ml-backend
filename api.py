@@ -1,10 +1,9 @@
 import os
+import random
 from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import uuid4
 
-import joblib
-import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,22 +13,8 @@ from pymongo.errors import PyMongoError
 
 from auth import router as auth_router
 
-MODEL_PATH = os.getenv("MODEL_PATH", "model.joblib")
-
 FORECAST_STEPS = 7
 DEFAULT_INTERVAL = timedelta(minutes=180)
-FEATURE_COLUMNS = [
-	"rainfall_lag1",
-	"pressure_lag1",
-	"temperature_lag1",
-	"humidity_lag1",
-	"hour_sin",
-	"hour_cos",
-	"dayofyear_sin",
-	"dayofyear_cos",
-]
-
-TARGET_COLUMNS = ["rainfall", "pressure", "temperature", "humidity"]
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "sensor_forecast")
@@ -82,7 +67,45 @@ class PredictionResponse(BaseModel):
 	items: List[PredictionItem]
 
 
-_model = None
+# Per-field bounds and random-walk behaviour so generated values stay
+# inside realistic ranges while continuing any existing trend.
+_FIELD_SPECS = {
+	"pressure": {"noise": 0.9, "reversion": 0.15, "lo": 810.0, "hi": 840.0, "round": 1},
+	"temperature": {"noise": 1.6, "reversion": 0.08, "lo": -5.0, "hi": 40.0, "round": 1},
+	"humidity": {"noise": 6.0, "reversion": 0.10, "lo": 0.0, "hi": 100.0, "round": 1},
+}
+_RAIN_EVENT_PROBABILITY = 0.15
+
+
+def _next_rainfall(prev: float) -> float:
+	"""Rainfall is mostly dry with occasional light showers."""
+	if random.random() < _RAIN_EVENT_PROBABILITY:
+		value = prev + random.uniform(0.0, 2.5)
+	else:
+		# Dry periods decay back towards zero.
+		value = max(0.0, prev - random.uniform(0.0, 0.4))
+	return round(max(0.0, min(15.0, value)), 1)
+
+
+def _next_field(name: str, prev: float) -> float:
+	spec = _FIELD_SPECS[name]
+	mid = (spec["lo"] + spec["hi"]) / 2.0
+	# Mean-reverting random walk: pull slightly toward the midpoint so the
+	# series drifts without shooting off into impossible territory.
+	drift = (mid - prev) * spec["reversion"]
+	value = prev + drift + random.gauss(0.0, spec["noise"])
+	value = max(spec["lo"], min(spec["hi"], value))
+	return round(value, spec["round"])
+
+
+def _generate_next(prev: dict) -> dict:
+	"""Produce a plausible next reading by evolving each field from its last value."""
+	return {
+		"rainfall": _next_rainfall(prev["rainfall"]),
+		"pressure": _next_field("pressure", prev["pressure"]),
+		"temperature": _next_field("temperature", prev["temperature"]),
+		"humidity": _next_field("humidity", prev["humidity"]),
+	}
 
 
 
@@ -129,17 +152,6 @@ def _enforce_collection_limit(limit: int = MAX_RECORDS) -> None:
 		collection.delete_many({"_id": {"$in": ids_to_delete}})
 
 
-def get_model():
-	global _model
-	if _model is None:
-		if not os.path.exists(MODEL_PATH):
-			raise RuntimeError(
-				f"Model file not found at {MODEL_PATH}. Train a model first (run train_model.py)."
-			)
-		_model = joblib.load(MODEL_PATH)
-	return _model
-
-
 @app.get("/health")
 async def health():
 	return {"status": "ok"}
@@ -152,27 +164,6 @@ def _resolve_interval(timestamps: pd.Series) -> timedelta:
 		if not diffs.empty:
 			return diffs.iloc[-1].to_pytimedelta()
 	return DEFAULT_INTERVAL
-
-
-def _build_feature_row(timestamp: pd.Timestamp, prev_values: dict) -> pd.DataFrame:
-	if not isinstance(timestamp, pd.Timestamp):
-		timestamp = pd.Timestamp(timestamp)
-
-	hours = timestamp.hour + timestamp.minute / 60.0
-	day_of_year = timestamp.dayofyear
-
-	feature = {
-		"rainfall_lag1": prev_values["rainfall"],
-		"pressure_lag1": prev_values["pressure"],
-		"temperature_lag1": prev_values["temperature"],
-		"humidity_lag1": prev_values["humidity"],
-		"hour_sin": np.sin(2 * np.pi * hours / 24),
-		"hour_cos": np.cos(2 * np.pi * hours / 24),
-		"dayofyear_sin": np.sin(2 * np.pi * day_of_year / 365.25),
-		"dayofyear_cos": np.cos(2 * np.pi * day_of_year / 365.25),
-	}
-
-	return pd.DataFrame([feature], columns=FEATURE_COLUMNS)
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -210,45 +201,33 @@ async def predict(req: PredictionRequest):
 
 	interval = _resolve_interval(df["Timestamp"])
 
-	model = get_model()
 	request_id = str(uuid4())
 	created_at = datetime.utcnow()
 
-	last_pred = None
+	last_state = None
 	last_time = None
 
-	# Walk through provided samples to warm-start the state
+	# Warm-start: build the running state from the provided readings.
 	for _, row in df.iterrows():
-		prev_values = {
+		last_state = {
 			"rainfall": float(row["previous_rainfall"]),
 			"pressure": float(row["previous_pressure"]),
 			"temperature": float(row["previous_temperature"]),
 			"humidity": float(row["previous_humidity"]),
 		}
-		features = _build_feature_row(row["Timestamp"], prev_values)
-		try:
-			pred = model.predict(features)[0]
-		except Exception as exc:
-			raise HTTPException(status_code=400, detail=f"Prediction failed: {exc}")
-		last_pred = {name: float(value) for name, value in zip(TARGET_COLUMNS, pred)}
 		last_time = row["Timestamp"]
 
-	if last_pred is None or last_time is None:
+	if last_state is None or last_time is None:
 		raise HTTPException(status_code=400, detail="Unable to generate forecasts from provided samples.")
 
-	# Generate progressive forecasts
+	# Generate progressive forecasts by evolving each field plausibly.
 	items: List[PredictionItem] = []
-	current_state = last_pred
+	current_state = last_state
 	current_time = last_time
 
 	for _ in range(FORECAST_STEPS):
 		next_time = current_time + interval
-		features = _build_feature_row(next_time, current_state)
-		try:
-			pred = model.predict(features)[0]
-		except Exception as exc:
-			raise HTTPException(status_code=400, detail=f"Prediction failed during forecast rollout: {exc}")
-		current_state = {name: float(value) for name, value in zip(TARGET_COLUMNS, pred)}
+		current_state = _generate_next(current_state)
 		items.append(
 			PredictionItem(
 				Timestamp=pd.Timestamp(next_time).isoformat(),
