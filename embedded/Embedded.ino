@@ -17,6 +17,7 @@ const char* WIFI_PASSWORD = "Espoir%55";
 // send + read data without a token.
 const char* BACKEND_URL       = "https://microweather-forecast-ml-backend.onrender.com/predict";
 const char* MEASUREMENTS_URL  = "https://microweather-forecast-ml-backend.onrender.com/measurements/latest";
+const char* MEASUREMENTS_POST_URL = "https://microweather-forecast-ml-backend.onrender.com/measurements";
 const char* HEALTH_URL        = "https://microweather-forecast-ml-backend.onrender.com/health";
 
 // ---------- NTP / Time ----------
@@ -382,6 +383,13 @@ bool fetchLatestMeasurements() {
   http.begin(client, MEASUREMENTS_URL);
 
   int statusCode = http.GET();
+  if (statusCode == 404) {
+    // Empty database (no "real" readings stored yet). Not an error:
+    // the next sendMeasurementToBackend() call will seed it.
+    Serial.println("No measurements on backend yet (HTTP 404) - will upload first reading.");
+    http.end();
+    return false;
+  }
   if (statusCode < 200 || statusCode >= 300) {
     Serial.printf("Measurements request failed: HTTP %d\n", statusCode);
     http.end();
@@ -419,6 +427,8 @@ bool fetchLatestMeasurements() {
 // Send current sensor readings to the backend (POST /measurements).
 // This stores the latest temp/hum/press on the server so they can
 // be retrieved later as fallback or for logging/analytics.
+// NOTE: POST goes to /measurements (not /measurements/latest,
+// which is GET-only and returns 405 on POST).
 // ==========================================================
 bool sendMeasurementToBackend() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -429,33 +439,46 @@ bool sendMeasurementToBackend() {
     }
   }
 
+  struct tm timeinfo;
+  String isoTimestamp = "";
+  if (getLocalTime(&timeinfo)) {
+    isoTimestamp = buildIsoTimestamp(timeinfo);
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
   client.setBufferSizes(1024, 512);
 
   HTTPClient http;
   http.setTimeout(8000);
-  http.begin(client, MEASUREMENTS_URL);
+  http.begin(client, MEASUREMENTS_POST_URL);
 
-  // Build JSON payload with current sensor readings
+  // Build JSON payload matching MeasurementCreate on the backend.
   DynamicJsonDocument doc(512);
+  if (isoTimestamp.length() > 0) {
+    doc["timestamp"] = isoTimestamp;
+  }
   doc["temperature"] = currentTemp;
   doc["humidity"]    = currentHum;
   doc["pressure"]    = currentPress;
+  doc["rainfall"]    = lastRainfall;
 
   String jsonBody;
   serializeJson(doc, jsonBody);
 
   http.addHeader("Content-Type", "application/json");
   int statusCode = http.POST(jsonBody);
-  http.end();
 
   if (statusCode >= 200 && statusCode < 300) {
     Serial.println("Measurement sent to backend OK");
+    http.end();
     return true;
   }
 
-  Serial.printf("Failed to send measurement: HTTP %d\n", statusCode);
+  // Log the server's error body so backend validation errors are visible.
+  String errBody = http.getString();
+  Serial.printf("Failed to send measurement: HTTP %d %s\n", statusCode, errBody.c_str());
+  http.end();
   return false;
 }
 
@@ -718,12 +741,17 @@ void loop() {
       updateSensorTiles();
     }
 
-    // Refresh the stored backend measurement every ~30 s so the
-    // device always has a recent server-side fallback reading.
-    if (now - lastMeasurementFetch >= 10000) {
+    // Push the current reading, then refresh the stored backend
+    // measurement every ~30 s so the device always has a recent
+    // server-side fallback reading. Send-first order matters: on a
+    // fresh/empty DB the GET returns 404 until the first POST lands.
+    if (now - lastMeasurementFetch >= 30000) {
       lastMeasurementFetch = now;
-      fetchLatestMeasurements();
-      sendMeasurementToBackend();
+      if (sendMeasurementToBackend()) {
+        fetchLatestMeasurements();
+      } else {
+        fetchLatestMeasurements();
+      }
     }
   }
 

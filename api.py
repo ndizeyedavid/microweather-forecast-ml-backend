@@ -311,21 +311,40 @@ class AllMeasurementsResponse(BaseModel):
 	items: List[MeasurementItem]
 
 
+class MeasurementCreate(BaseModel):
+	timestamp: Optional[str] = Field(default=None, description="Observation timestamp (ISO format). Defaults to server time.")
+	temperature: Optional[float] = Field(default=None)
+	humidity: Optional[float] = Field(default=None)
+	pressure: Optional[float] = Field(default=None)
+	rainfall: Optional[float] = Field(default=0.0)
+
+
 @app.post("/measurements", response_model=MeasurementResponse)
-async def create_measurement():
+async def create_measurement(payload: MeasurementCreate):
 	try:
 		collection = _get_collection()
+		if payload.timestamp:
+			try:
+				ts = pd.Timestamp(payload.timestamp).to_pydatetime()
+			except Exception:
+				ts = datetime.utcnow()
+		else:
+			ts = datetime.utcnow()
+		now = datetime.utcnow()
 		record = {
-			"timestamp": datetime.utcnow(),
+			"timestamp": ts,
 			"label": "real",
+			"source": "board",
 			"values": {
-				"temperature": float(request.json.get("temperature", 0.0)),
-				"humidity": float(request.json.get("humidity", 0.0)),
-				"pressure": float(request.json.get("pressure", 0.0)),
-				"rainfall": 0.0,
+				"temperature": float(payload.temperature if payload.temperature is not None else 0.0),
+				"humidity": float(payload.humidity if payload.humidity is not None else 0.0),
+				"pressure": float(payload.pressure if payload.pressure is not None else 0.0),
+				"rainfall": float(payload.rainfall if payload.rainfall is not None else 0.0),
 			},
+			"created_at": now,
 		}
 		collection.insert_one(record)
+		_enforce_collection_limit()
 		serialized = _serialize_document(record)
 		return MeasurementResponse(
 			timestamp=serialized["timestamp"],
@@ -368,15 +387,16 @@ async def get_all_measurements():
 		items = []
 		for doc in docs:
 			serialized = _serialize_document(doc)
+			values = serialized.get("values", {})
 			items.append(MeasurementItem(
 				id=serialized["_id"],
-				timestamp=serialized["timestamp"],
-				temperature=serialized["values"]["temperature"],
-				humidity=serialized["values"]["humidity"],
-				pressure=serialized["values"]["pressure"],
-				rainfall=serialized["values"]["rainfall"],
-				label=serialized["label"],
-				source=serialized["source"]
+				timestamp=serialized.get("timestamp", ""),
+				temperature=float(values.get("temperature", 0.0)),
+				humidity=float(values.get("humidity", 0.0)),
+				pressure=float(values.get("pressure", 0.0)),
+				rainfall=float(values.get("rainfall", 0.0)),
+				label=serialized.get("label", ""),
+				source=serialized.get("source", "")
 			))
 		return AllMeasurementsResponse(items=items)
 	except PyMongoError as exc:
