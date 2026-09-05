@@ -311,6 +311,34 @@ class AllMeasurementsResponse(BaseModel):
 	items: List[MeasurementItem]
 
 
+@app.post("/measurements", response_model=MeasurementResponse)
+async def create_measurement():
+	try:
+		collection = _get_collection()
+		record = {
+			"timestamp": datetime.utcnow(),
+			"label": "real",
+			"values": {
+				"temperature": float(request.json.get("temperature", 0.0)),
+				"humidity": float(request.json.get("humidity", 0.0)),
+				"pressure": float(request.json.get("pressure", 0.0)),
+				"rainfall": 0.0,
+			},
+		}
+		collection.insert_one(record)
+		serialized = _serialize_document(record)
+		return MeasurementResponse(
+			timestamp=serialized["timestamp"],
+			values=MeasurementValues(
+				temperature=serialized["values"]["temperature"],
+				humidity=serialized["values"]["humidity"],
+				pressure=serialized["values"]["pressure"],
+				rainfall=serialized["values"]["rainfall"]
+			)
+		)
+	except PyMongoError as exc:
+		raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
 @app.get("/measurements/latest", response_model=MeasurementResponse)
 async def get_latest_measurement():
 	try:

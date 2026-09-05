@@ -416,6 +416,50 @@ bool fetchLatestMeasurements() {
 }
 
 // ==========================================================
+// Send current sensor readings to the backend (POST /measurements).
+// This stores the latest temp/hum/press on the server so they can
+// be retrieved later as fallback or for logging/analytics.
+// ==========================================================
+bool sendMeasurementToBackend() {
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiReconnect();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi not connected. Skipping measurement send.");
+      return false;
+    }
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setBufferSizes(1024, 512);
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.begin(client, MEASUREMENTS_URL);
+
+  // Build JSON payload with current sensor readings
+  DynamicJsonDocument doc(512);
+  doc["temperature"] = currentTemp;
+  doc["humidity"]    = currentHum;
+  doc["pressure"]    = currentPress;
+
+  String jsonBody;
+  serializeJson(doc, jsonBody);
+
+  http.addHeader("Content-Type", "application/json");
+  int statusCode = http.POST(jsonBody);
+  http.end();
+
+  if (statusCode >= 200 && statusCode < 300) {
+    Serial.println("Measurement sent to backend OK");
+    return true;
+  }
+
+  Serial.printf("Failed to send measurement: HTTP %d\n", statusCode);
+  return false;
+}
+
+// ==========================================================
 // Helper: draw text centered horizontally (compatible version)
 // ==========================================================
 void drawCenteredText(const char* text, int y, int fontSize, uint16_t color) {
@@ -676,9 +720,10 @@ void loop() {
 
     // Refresh the stored backend measurement every ~30 s so the
     // device always has a recent server-side fallback reading.
-    if (now - lastMeasurementFetch >= 30000) {
+    if (now - lastMeasurementFetch >= 10000) {
       lastMeasurementFetch = now;
       fetchLatestMeasurements();
+      sendMeasurementToBackend();
     }
   }
 
