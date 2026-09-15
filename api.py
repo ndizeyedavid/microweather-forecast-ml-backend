@@ -1,6 +1,6 @@
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from uuid import uuid4
 
@@ -128,7 +128,9 @@ def _serialize_document(doc: dict) -> dict:
 		serialized["timestamp"] = timestamp.isoformat()
 	created_at = serialized.get("created_at")
 	if isinstance(created_at, datetime):
-		serialized["created_at"] = created_at.isoformat()
+		if created_at.tzinfo is None:
+			created_at = created_at.replace(tzinfo=timezone.utc)
+		serialized["created_at"] = created_at.astimezone(timezone.utc).isoformat()
 	return serialized
 
 
@@ -242,7 +244,7 @@ async def predict(req: PredictionRequest):
 		)
 
 	request_id = str(uuid4())
-	created_at = datetime.utcnow()
+	created_at = datetime.now(timezone.utc)
 
 	# Generate progressive forecasts by evolving each field plausibly from the
 	# most recent real state.
@@ -328,10 +330,10 @@ async def create_measurement(payload: MeasurementCreate):
 			try:
 				ts = pd.Timestamp(payload.timestamp).to_pydatetime()
 			except Exception:
-				ts = datetime.utcnow()
+				ts = datetime.now(timezone.utc)
 		else:
-			ts = datetime.utcnow()
-		now = datetime.utcnow()
+			ts = datetime.now(timezone.utc)
+		now = datetime.now(timezone.utc)
 		record = {
 			"timestamp": ts,
 			"label": "real",
