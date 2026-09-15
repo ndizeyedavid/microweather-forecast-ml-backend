@@ -299,6 +299,7 @@ class MeasurementResponse(BaseModel):
 class MeasurementItem(BaseModel):
 	id: str
 	timestamp: str
+	createdAt: str
 	temperature: float
 	humidity: float
 	pressure: float
@@ -391,6 +392,7 @@ async def get_all_measurements():
 			items.append(MeasurementItem(
 				id=serialized["_id"],
 				timestamp=serialized.get("timestamp", ""),
+				createdAt=serialized.get("created_at", ""),
 				temperature=float(values.get("temperature", 0.0)),
 				humidity=float(values.get("humidity", 0.0)),
 				pressure=float(values.get("pressure", 0.0)),
